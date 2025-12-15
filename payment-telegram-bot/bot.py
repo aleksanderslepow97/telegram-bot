@@ -1,20 +1,24 @@
-import asyncio
 import logging
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.contrib.fsm_storage.redis import RedisStorage2
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
-from aiogram.types import ContentType, PreCheckoutQuery, LabeledPrice
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils import executor
 import config
-from database import db, User, Payment, Service
+from database import db, Service
 from keyboards import (
-    get_main_keyboard, get_admin_keyboard,
-    get_payment_amount_keyboard, get_payment_method_keyboard,
-    get_services_keyboard, get_admin_services_keyboard
+    get_referral_keyboard, get_currency_keyboard,
+    get_subscription_keyboard
 )
 from payment_system import PaymentManager
+from admin_notifications import AdminNotifier
+from referral_system import ReferralSystem
+from promo_system import PromoSystem
+from subscription_system import SubscriptionSystem, SubscriptionStatus
+from multi_currency import CurrencyConverter, SupportedCurrency
+from export_system import ExportSystem
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -31,8 +35,14 @@ except:
 
 dp = Dispatcher(bot, storage=storage)
 
-# Инициализация менеджера платежей
+# Инициализация всех систем
 payment_manager = PaymentManager(bot)
+admin_notifier = AdminNotifier(bot)
+referral_system = ReferralSystem()
+promo_system = PromoSystem()
+subscription_system = SubscriptionSystem(bot)
+currency_converter = CurrencyConverter()
+export_system = ExportSystem()
 
 
 # Состояния FSM
@@ -41,6 +51,7 @@ class PaymentStates(StatesGroup):
     waiting_for_amount = State()
     waiting_for_payment_method = State()
     waiting_for_custom_amount = State()
+    waiting_for_promo_code = State()
 
 
 class AdminStates(StatesGroup):
@@ -48,736 +59,394 @@ class AdminStates(StatesGroup):
     waiting_for_service_name = State()
     waiting_for_service_description = State()
     waiting_for_service_price = State()
+    waiting_for_promo_code = State()
+    waiting_for_promo_discount = State()
+    waiting_for_currency_code = State()
+    waiting_for_currency_name = State()
 
 
-# Вспомогательные функции
-async def get_or_create_user(telegram_user: types.User):
-    """Получение или создание пользователя в базе данных
-
-    Args:
-        telegram_user (types.User): Объект пользователя из Telegram
-
-    Returns:
-        User: Объект пользователя из базы данных
-    """
-    session = db.get_session()
-    user = session.query(User).filter(User.telegram_id == telegram_user.id).first()
-
-    if not user:
-        user = User(
-            telegram_id=telegram_user.id,
-            username=telegram_user.username,
-            first_name=telegram_user.first_name,
-            last_name=telegram_user.last_name,
-            is_admin=telegram_user.id in config.Config.ADMINS
-        )
-        session.add(user)
-        session.commit()
-
-    session.close()
-    return user
+class ReferralStates(StatesGroup):
+    """Состояния для реферальной системы"""
+    waiting_for_referral_code = State()
 
 
-async def update_user_balance(user_id: int, amount: float):
-    """Обновление баланса пользователя
+# Новые обработчики команд для расширенной функциональности
 
-    Args:
-        user_id (int): ID пользователя
-        amount (float): Сумма для пополнения (может быть отрицательной)
-
-    Returns:
-        bool: Успешность операции
-    """
-    try:
-        session = db.get_session()
-        user = session.query(User).filter(User.telegram_id == user_id).first()
-
-        if user:
-            user.balance += amount
-            session.commit()
-            session.close()
-            return True
-
-        session.close()
-        return False
-    except Exception as e:
-        logger.error(f"Ошибка обновления баланса: {e}")
-        return False
-
-
-# Обработчики команд
-@dp.message_handler(commands=['start'])
-async def cmd_start(message: types.Message):
-    """Обработчик команды /start
-
-    Args:
-        message (types.Message): Сообщение от пользователя
-    """
+@dp.message_handler(commands=['referral'])
+async def cmd_referral(message: types.Message):
+    """Обработчик команды /referral"""
     user = await get_or_create_user(message.from_user)
 
-    welcome_text = (
-        f"👋 Привет, {message.from_user.first_name}!\n\n"
-        f"Я — бот для оплаты услуг. Вот что я умею:\n\n"
-        f"💳 Пополнить баланс — пополните ваш внутренний счет\n"
-        f"🛒 Услуги — просмотр и покупка доступных услуг\n"
-        f"💰 Мой баланс — проверка текущего баланса\n"
-        f"📊 История платежей — просмотр ваших транзакций\n"
-        f"🆘 Помощь — справка по использованию бота\n\n"
-        f"Ваш ID: {user.id}\n"
-        f"Ваш баланс: {user.balance:.2f} RUB"
+    # Получаем статистику рефералов
+    stats = referral_system.get_user_referral_stats(user.id)
+
+    # Получаем реферальные ссылки
+    links = referral_system.get_referral_links(user.id)
+
+    text = (
+        f"👥 *Реферальная система*\n\n"
+        f"*Всего рефералов:* {stats['total_referrals']}\n"
+        f"*Активных рефералов:* {stats['active_referrals']}\n"
+        f"*Рефералов за 30 дней:* {stats['recent_referrals']}\n"
+        f"*Общее вознаграждение:* {stats['total_reward']:.2f} RUB\n\n"
+        f"За каждого приглашенного друга вы получаете {config.Config.REFERRAL_REWARD_PERCENT}% от его первого платежа!"
     )
 
-    if user.is_admin:
-        welcome_text += "\n\n👑 Вы администратор бота!"
+    keyboard = get_referral_keyboard(links)
 
-    await message.answer(welcome_text, reply_markup=get_main_keyboard())
+    await message.answer(text, parse_mode="Markdown", reply_markup=keyboard)
 
 
-@dp.message_handler(commands=['admin'])
-async def cmd_admin(message: types.Message):
-    """Обработчик команды /admin (только для администраторов)
-
-    Args:
-        message (types.Message): Сообщение от пользователя
-    """
+@dp.message_handler(commands=['promo'])
+async def cmd_promo(message: types.Message):
+    """Обработчик команды /promo"""
     user = await get_or_create_user(message.from_user)
 
-    if not user.is_admin:
-        await message.answer("⛔ У вас нет доступа к админ-панели.")
-        return
-
-    admin_text = (
-        f"👑 Админ-панель\n\n"
-        f"ID: {user.id}\n"
-        f"Telegram ID: {user.telegram_id}\n"
-        f"Баланс: {user.balance:.2f} RUB\n\n"
-        f"Выберите действие:"
+    text = (
+        "🎫 *Промокоды и скидки*\n\n"
+        "Введите промокод для получения скидки:\n"
+        "Или используйте команду /promo_apply [код]"
     )
 
-    await message.answer(admin_text, reply_markup=get_admin_keyboard())
+    await message.answer(text, parse_mode="Markdown")
+    await PaymentStates.waiting_for_promo_code.set()
 
 
-@dp.message_handler(text="💳 Пополнить баланс")
-async def cmd_deposit(message: types.Message):
-    """Обработчик кнопки пополнения баланса
-
-    Args:
-        message (types.Message): Сообщение от пользователя
-    """
-    await message.answer(
-        "💳 Выберите сумму для пополнения баланса:",
-        reply_markup=get_payment_amount_keyboard()
-    )
-
-
-@dp.message_handler(text="💰 Мой баланс")
-async def cmd_balance(message: types.Message):
-    """Обработчик кнопки проверки баланса
-
-    Args:
-        message (types.Message): Сообщение от пользователя
-    """
-    user = await get_or_create_user(message.from_user)
-
-    balance_text = (
-        f"💰 Ваш баланс: {user.balance:.2f} RUB\n\n"
-        f"ID пользователя: {user.id}\n"
-        f"Telegram ID: {user.telegram_id}"
-    )
-
-    await message.answer(balance_text)
-
-
-@dp.message_handler(text="🛒 Услуги")
-async def cmd_services(message: types.Message):
-    """Обработчик кнопки просмотра услуг
-
-    Args:
-        message (types.Message): Сообщение от пользователя
-    """
-    session = db.get_session()
-    services = session.query(Service).filter(Service.is_active == True).all()
-    session.close()
-
-    if not services:
-        await message.answer("😔 На данный момент услуги отсутствуют.")
-        return
-
-    services_text = "🛒 Доступные услуги:\n\n"
-    for service in services:
-        services_text += f"• {service.name}\n"
-        services_text += f"  Описание: {service.description}\n"
-        services_text += f"  Цена: {service.price:.2f} {service.currency}\n\n"
-
-    await message.answer(services_text, reply_markup=get_services_keyboard(services))
-
-
-@dp.message_handler(text="📊 История платежей")
-async def cmd_payment_history(message: types.Message):
-    """Обработчик кнопки истории платежей
-
-    Args:
-        message (types.Message): Сообщение от пользователя
-    """
+@dp.message_handler(commands=['subscription'])
+async def cmd_subscription(message: types.Message):
+    """Обработчик команды /subscription"""
     user = await get_or_create_user(message.from_user)
 
     session = db.get_session()
-    payments = session.query(Payment).filter(
-        Payment.user_id == user.id
-    ).order_by(Payment.created_at.desc()).limit(10).all()
-    session.close()
-
-    if not payments:
-        await message.answer("📊 У вас пока нет платежей.")
-        return
-
-    history_text = "📊 История ваших платежей:\n\n"
-    for payment in payments:
-        status_emoji = {
-            "pending": "⏳",
-            "completed": "✅",
-            "failed": "❌",
-            "cancelled": "🚫"
-        }.get(payment.status, "❓")
-
-        history_text += f"{status_emoji} {payment.amount:.2f} {payment.currency}\n"
-        history_text += f"  Дата: {payment.created_at.strftime('%d.%m.%Y %H:%M')}\n"
-        history_text += f"  Статус: {payment.status}\n"
-        if payment.completed_at:
-            history_text += f"  Завершен: {payment.completed_at.strftime('%d.%m.%Y %H:%M')}\n"
-        history_text += "\n"
-
-    await message.answer(history_text)
-
-
-@dp.message_handler(text="🆘 Помощь")
-async def cmd_help(message: types.Message):
-    """Обработчик кнопки помощи
-
-    Args:
-        message (types.Message): Сообщение от пользователя
-    """
-    help_text = (
-        "🆘 Помощь по использованию бота:\n\n"
-        "💳 Пополнить баланс — пополнение вашего внутреннего счета\n"
-        "🛒 Услуги — просмотр и покупка доступных услуг\n"
-        "💰 Мой баланс — проверка текущего баланса\n"
-        "📊 История платежей — просмотр ваших транзакций\n\n"
-        "Для пополнения баланса:\n"
-        "1. Нажмите '💳 Пополнить баланс'\n"
-        "2. Выберите сумму или введите свою\n"
-        "3. Выберите способ оплаты\n"
-        "4. Оплатите счет\n\n"
-        "Для покупки услуги:\n"
-        "1. Нажмите '🛒 Услуги'\n"
-        "2. Выберите нужную услугу\n"
-        "3. Оплатите счет\n\n"
-        "Если у вас возникли проблемы, обратитесь к администратору."
-    )
-
-    await message.answer(help_text)
-
-
-# Обработчики админ-панели
-@dp.message_handler(text="📊 Статистика")
-async def cmd_admin_stats(message: types.Message):
-    """Обработчик кнопки статистики (админ)
-
-    Args:
-        message (types.Message): Сообщение от пользователя
-    """
-    user = await get_or_create_user(message.from_user)
-
-    if not user.is_admin:
-        await message.answer("⛔ У вас нет доступа к админ-панели.")
-        return
-
-    session = db.get_session()
-
-    # Статистика пользователей
-    total_users = session.query(User).count()
-    new_users_today = session.query(User).filter(
-        db.func.date(User.created_at) == db.func.date('now')
-    ).count()
-
-    # Статистика платежей
-    total_payments = session.query(Payment).count()
-    completed_payments = session.query(Payment).filter(Payment.status == "completed").count()
-    total_revenue = session.query(db.func.sum(Payment.amount)).filter(
-        Payment.status == "completed"
-    ).scalar() or 0
-
-    # Статистика услуг
-    total_services = session.query(Service).count()
-    active_services = session.query(Service).filter(Service.is_active == True).count()
-
-    session.close()
-
-    stats_text = (
-        "📊 Статистика бота:\n\n"
-        f"👥 Пользователи:\n"
-        f"  Всего: {total_users}\n"
-        f"  Новых сегодня: {new_users_today}\n\n"
-        f"💳 Платежи:\n"
-        f"  Всего: {total_payments}\n"
-        f"  Успешных: {completed_payments}\n"
-        f"  Общая выручка: {total_revenue:.2f} RUB\n\n"
-        f"🛒 Услуги:\n"
-        f"  Всего: {total_services}\n"
-        f"  Активных: {active_services}"
-    )
-
-    await message.answer(stats_text)
-
-
-@dp.message_handler(text="👥 Пользователи")
-async def cmd_admin_users(message: types.Message):
-    """Обработчик кнопки управления пользователями (админ)
-
-    Args:
-        message (types.Message): Сообщение от пользователя
-    """
-    user = await get_or_create_user(message.from_user)
-
-    if not user.is_admin:
-        await message.answer("⛔ У вас нет доступа к админ-панели.")
-        return
-
-    session = db.get_session()
-    users = session.query(User).order_by(User.created_at.desc()).limit(10).all()
-    session.close()
-
-    users_text = "👥 Последние 10 пользователей:\n\n"
-    for user_item in users:
-        users_text += f"ID: {user_item.id}\n"
-        users_text += f"  Telegram: @{user_item.username or 'нет'}\n"
-        users_text += f"  Имя: {user_item.first_name or ''} {user_item.last_name or ''}\n"
-        users_text += f"  Баланс: {user_item.balance:.2f} RUB\n"
-        users_text += f"  Регистрация: {user_item.created_at.strftime('%d.%m.%Y')}\n"
-        users_text += f"  Админ: {'Да' if user_item.is_admin else 'Нет'}\n\n"
-
-    await message.answer(users_text)
-
-
-@dp.message_handler(text="💼 Управление услугами")
-async def cmd_admin_services(message: types.Message):
-    """Обработчик кнопки управления услугами (админ)
-
-    Args:
-        message (types.Message): Сообщение от пользователя
-    """
-    user = await get_or_create_user(message.from_user)
-
-    if not user.is_admin:
-        await message.answer("⛔ У вас нет доступа к админ-панели.")
-        return
-
-    session = db.get_session()
-    services = session.query(Service).order_by(Service.created_at.desc()).all()
-    session.close()
-
-    if not services:
-        await message.answer("😔 Услуги отсутствуют.")
-        return
-
-    await message.answer(
-        "💼 Управление услугами:\n\nВыберите услугу для редактирования:",
-        reply_markup=get_admin_services_keyboard(services)
-    )
-
-
-@dp.message_handler(text="💳 Платежи")
-async def cmd_admin_payments(message: types.Message):
-    """Обработчик кнопки управления платежами (админ)
-
-    Args:
-        message (types.Message): Сообщение от пользователя
-    """
-    user = await get_or_create_user(message.from_user)
-
-    if not user.is_admin:
-        await message.answer("⛔ У вас нет доступа к админ-панели.")
-        return
-
-    session = db.get_session()
-    payments = session.query(Payment).order_by(Payment.created_at.desc()).limit(10).all()
-    session.close()
-
-    payments_text = "💳 Последние 10 платежей:\n\n"
-    for payment in payments:
-        status_emoji = {
-            "pending": "⏳",
-            "completed": "✅",
-            "failed": "❌",
-            "cancelled": "🚫"
-        }.get(payment.status, "❓")
-
-        payments_text += f"{status_emoji} Платеж #{payment.id}\n"
-        payments_text += f"  Пользователь: {payment.user_id}\n"
-        payments_text += f"  Сумма: {payment.amount:.2f} {payment.currency}\n"
-        payments_text += f"  Статус: {payment.status}\n"
-        payments_text += f"  Дата: {payment.created_at.strftime('%d.%m.%Y %H:%M')}\n\n"
-
-    await message.answer(payments_text)
-
-
-@dp.message_handler(text="🔙 В меню")
-async def cmd_back_to_menu(message: types.Message):
-    """Обработчик кнопки возврата в меню
-
-    Args:
-        message (types.Message): Сообщение от пользователя
-    """
-    await cmd_start(message)
-
-
-# Обработчики колбэков
-@dp.callback_query_handler(lambda c: c.data.startswith('pay_'))
-async def process_payment_amount(callback_query: types.CallbackQuery, state: FSMContext):
-    """Обработчик выбора суммы платежа
-
-    Args:
-        callback_query (types.CallbackQuery): Колбэк-запрос
-        state (FSMContext): Состояние FSM
-    """
-    if callback_query.data == 'custom_amount':
-        await bot.answer_callback_query(callback_query.id)
-        await bot.send_message(
-            callback_query.from_user.id,
-            "💳 Введите сумму для пополнения (в RUB):"
-        )
-        await PaymentStates.waiting_for_custom_amount.set()
-        return
-
-    if callback_query.data == 'cancel':
-        await bot.answer_callback_query(callback_query.id)
-        await bot.send_message(
-            callback_query.from_user.id,
-            "❌ Операция отменена.",
-            reply_markup=get_main_keyboard()
-        )
-        await state.finish()
-        return
-
-    amount = float(callback_query.data.split('_')[1])
-
-    # Сохраняем сумму в состоянии
-    await state.update_data(amount=amount)
-
-    # Показываем выбор метода оплаты
-    providers = payment_manager.get_available_providers()
-
-    if not providers:
-        await bot.answer_callback_query(callback_query.id)
-        await bot.send_message(
-            callback_query.from_user.id,
-            "😔 На данный момент оплата недоступна. Попробуйте позже."
-        )
-        return
-
-    await bot.answer_callback_query(callback_query.id)
-    await bot.send_message(
-        callback_query.from_user.id,
-        f"💳 Вы выбрали сумму: {amount} RUB\n\nВыберите способ оплаты:",
-        reply_markup=get_payment_method_keyboard(amount)
-    )
-
-    await PaymentStates.waiting_for_payment_method.set()
-
-
-@dp.callback_query_handler(lambda c: c.data.startswith('payment_method_'))
-async def process_payment_method(callback_query: types.CallbackQuery, state: FSMContext):
-    """Обработчик выбора метода оплаты
-
-    Args:
-        callback_query (types.CallbackQuery): Колбэк-запрос
-        state (FSMContext): Состояние FSM
-    """
-    if callback_query.data == 'cancel':
-        await bot.answer_callback_query(callback_query.id)
-        await bot.send_message(
-            callback_query.from_user.id,
-            "❌ Операция отменена.",
-            reply_markup=get_main_keyboard()
-        )
-        await state.finish()
-        return
-
-    # Получаем метод оплаты и сумму
-    data_parts = callback_query.data.split('_')
-    provider = data_parts[2]
-    amount = float(data_parts[3])
-
-    user = await get_or_create_user(callback_query.from_user)
-
-    await bot.answer_callback_query(callback_query.id)
-
-    # Создаем платеж
-    payment_data = await payment_manager.create_payment(
-        provider=provider,
-        user_id=user.id,
-        amount=amount,
-        currency="RUB",
-        description="Пополнение баланса"
-    )
-
-    if not payment_data:
-        await bot.send_message(
-            callback_query.from_user.id,
-            "😔 Произошла ошибка при создании платежа. Попробуйте позже.",
-            reply_markup=get_main_keyboard()
-        )
-        await state.finish()
-        return
-
-    # Обрабатываем разные типы платежей
-    if provider == "telegram":
-        # Отправляем инвойс для Telegram Payments
-        prices = [LabeledPrice(label="Пополнение баланса", amount=int(amount * 100))]
-
-        await bot.send_invoice(
-            chat_id=callback_query.from_user.id,
-            title="Пополнение баланса",
-            description=f"Пополнение баланса на сумму {amount} RUB",
-            payload=payment_data["payload"],
-            provider_token=config.Config.PAYMENT_PROVIDER_TOKEN,
-            currency="RUB",
-            prices=prices,
-            start_parameter="payment",
-            need_name=False,
-            need_email=False,
-            need_phone_number=False,
-            need_shipping_address=False,
-            is_flexible=False
-        )
-
-    elif provider == "yookassa":
-        # Отправляем ссылку для оплаты через ЮKassa
-        payment_text = (
-            f"💳 Оплата через ЮKassa\n\n"
-            f"Сумма: {amount} RUB\n"
-            f"ID платежа: {payment_data['payment_id']}\n\n"
-            f"Для оплаты перейдите по ссылке:\n"
-            f"{payment_data['confirmation_url']}\n\n"
-            f"После оплаты статус платежа обновится автоматически."
-        )
-
-        await bot.send_message(
-            callback_query.from_user.id,
-            payment_text,
-            reply_markup=get_main_keyboard()
-        )
-
-    await state.finish()
-
-
-@dp.callback_query_handler(lambda c: c.data.startswith('service_'))
-async def process_service_selection(callback_query: types.CallbackQuery):
-    """Обработчик выбора услуги
-
-    Args:
-        callback_query (types.CallbackQuery): Колбэк-запрос
-    """
-    if callback_query.data == 'cancel':
-        await bot.answer_callback_query(callback_query.id)
-        await bot.send_message(
-            callback_query.from_user.id,
-            "❌ Операция отменена.",
-            reply_markup=get_main_keyboard()
-        )
-        return
-
-    service_id = int(callback_query.data.split('_')[1])
-
-    session = db.get_session()
-    service = session.query(Service).filter(Service.id == service_id).first()
-    user = await get_or_create_user(callback_query.from_user)
-    session.close()
-
-    if not service:
-        await bot.answer_callback_query(callback_query.id)
-        await bot.send_message(
-            callback_query.from_user.id,
-            "😔 Услуга не найдена.",
-            reply_markup=get_main_keyboard()
-        )
-        return
-
-    if user.balance < service.price:
-        await bot.answer_callback_query(callback_query.id)
-        await bot.send_message(
-            callback_query.from_user.id,
-            f"❌ Недостаточно средств на балансе.\n\n"
-            f"Стоимость услуги: {service.price:.2f} RUB\n"
-            f"Ваш баланс: {user.balance:.2f} RUB\n\n"
-            f"Пополните баланс для покупки услуги."
-        )
-        return
-
-    # Списываем средства
-    success = await update_user_balance(user.telegram_id, -service.price)
-
-    if success:
-        # Создаем запись о покупке
-        session = db.get_session()
-        payment = Payment(
-            user_id=user.id,
-            amount=service.price,
-            currency=service.currency,
-            status="completed",
-            payment_provider="internal",
-            invoice_payload=f"Покупка услуги: {service.name}"
-        )
-        session.add(payment)
-        session.commit()
-        session.close()
-
-        await bot.answer_callback_query(callback_query.id)
-        await bot.send_message(
-            callback_query.from_user.id,
-            f"✅ Услуга '{service.name}' успешно приобретена!\n\n"
-            f"💳 С вашего счета списано: {service.price:.2f} RUB\n"
-            f"💰 Текущий баланс: {user.balance - service.price:.2f} RUB\n\n"
-            f"Описание услуги:\n{service.description}",
-            reply_markup=get_main_keyboard()
-        )
-    else:
-        await bot.answer_callback_query(callback_query.id)
-        await bot.send_message(
-            callback_query.from_user.id,
-            "😔 Произошла ошибка при покупке услуги. Попробуйте позже.",
-            reply_markup=get_main_keyboard()
-        )
-
-
-# Обработчики сообщений для состояний FSM
-@dp.message_handler(state=PaymentStates.waiting_for_custom_amount)
-async def process_custom_amount(message: types.Message, state: FSMContext):
-    """Обработчик ввода пользовательской суммы
-
-    Args:
-        message (types.Message): Сообщение от пользователя
-        state (FSMContext): Состояние FSM
-    """
-    try:
-        amount = float(message.text)
-
-        if amount <= 0:
-            await message.answer("❌ Сумма должна быть больше нуля. Введите корректную сумму:")
-            return
-
-        if amount > 100000:  # Ограничение максимальной суммы
-            await message.answer("❌ Сумма слишком большая. Введите сумму до 100 000 RUB:")
-            return
-
-        # Сохраняем сумму в состоянии
-        await state.update_data(amount=amount)
-
-        # Показываем выбор метода оплаты
-        providers = payment_manager.get_available_providers()
-
-        if not providers:
-            await message.answer("😔 На данный момент оплата недоступна. Попробуйте позже.")
-            await state.finish()
-            return
-
-        await message.answer(
-            f"💳 Вы ввели сумму: {amount} RUB\n\nВыберите способ оплаты:",
-            reply_markup=get_payment_method_keyboard(amount)
-        )
-
-        await PaymentStates.waiting_for_payment_method.set()
-
-    except ValueError:
-        await message.answer("❌ Пожалуйста, введите корректную сумму (число):")
-
-
-# Обработчики платежей
-@dp.pre_checkout_query_handler()
-async def process_pre_checkout_query(pre_checkout_query: PreCheckoutQuery):
-    """Обработчик предварительного запроса на оплату (для Telegram Payments)
-
-    Args:
-        pre_checkout_query (PreCheckoutQuery): Предварительный запрос на оплату
-    """
-    await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
-
-
-@dp.message_handler(content_types=ContentType.SUCCESSFUL_PAYMENT)
-async def process_successful_payment(message: types.Message):
-    """Обработчик успешного платежа (для Telegram Payments)
-
-    Args:
-        message (types.Message): Сообщение об успешной оплате
-    """
-    payment_info = message.successful_payment
-
-    # Ищем платеж в базе данных по invoice_payload
-    session = db.get_session()
-    payment = session.query(Payment).filter(
-        Payment.invoice_payload == payment_info.invoice_payload
+    plans = session.query(SubscriptionPlan).filter(
+        SubscriptionPlan.is_active == True
+    ).all()
+
+    # Проверяем текущую подписку пользователя
+    current_subscription = session.query(UserSubscription).filter(
+        UserSubscription.user_id == user.id,
+        UserSubscription.status == SubscriptionStatus.ACTIVE
     ).first()
 
-    if payment:
-        # Обновляем статус платежа
-        payment.status = "completed"
-        payment.completed_at = db.func.now()
-        payment.provider_payment_id = payment_info.telegram_payment_charge_id
+    session.close()
 
-        # Пополняем баланс пользователя
-        user = session.query(User).filter(User.id == payment.user_id).first()
-        if user:
-            user.balance += payment.amount
-            session.commit()
+    if current_subscription:
+        plan = current_subscription.plan
+        text = (
+            f"✅ *Ваша текущая подписка*\n\n"
+            f"*План:* {plan.name}\n"
+            f"*Цена:* {plan.price:.2f} {plan.currency}\n"
+            f"*Статус:* {current_subscription.status.value}\n"
+            f"*Следующий платеж:* {current_subscription.next_billing_date.strftime('%d.%m.%Y')}\n"
+            f"*Автопродление:* {'Включено' if current_subscription.auto_renewal else 'Выключено'}"
+        )
+    else:
+        text = "🛒 *Доступные подписки*\n\nВыберите план подписки:"
 
-            await message.answer(
-                f"✅ Платеж на сумму {payment.amount:.2f} {payment.currency} успешно завершен!\n\n"
-                f"💰 Ваш баланс пополнен на {payment.amount:.2f} {payment.currency}\n"
-                f"💳 Текущий баланс: {user.balance:.2f} {payment.currency}",
-                reply_markup=get_main_keyboard()
+    keyboard = get_subscription_keyboard(plans, current_subscription)
+
+    await message.answer(text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+@dp.message_handler(commands=['currency'])
+async def cmd_currency(message: types.Message):
+    """Обработчик команды /currency"""
+    user = await get_or_create_user(message.from_user)
+
+    currencies = await currency_converter.get_supported_currencies()
+    default_currency = await currency_converter.get_default_currency()
+
+    text = (
+        "💰 *Настройки валюты*\n\n"
+        f"*Текущая валюта по умолчанию:* {default_currency.code if default_currency else 'RUB'}\n\n"
+        "Выберите валюту для отображения цен:"
+    )
+
+    keyboard = get_currency_keyboard(currencies)
+
+    await message.answer(text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+@dp.message_handler(commands=['export'])
+async def cmd_export(message: types.Message):
+    """Обработчик команды /export (только для администраторов)"""
+    user = await get_or_create_user(message.from_user)
+
+    if not user.is_admin:
+        await message.answer("⛔ У вас нет доступа к этой команде.")
+        return
+
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        InlineKeyboardButton("📊 CSV платежей", callback_data="export_payments_csv"),
+        InlineKeyboardButton("📊 Excel платежей", callback_data="export_payments_excel"),
+        InlineKeyboardButton("👥 CSV пользователей", callback_data="export_users_csv"),
+        InlineKeyboardButton("📈 JSON статистика", callback_data="export_statistics_json"),
+        InlineKeyboardButton("📋 Детальный отчет", callback_data="export_detailed_report"),
+        InlineKeyboardButton("❌ Отмена", callback_data="cancel_export")
+    )
+
+    await message.answer("📤 *Экспорт данных*\n\nВыберите формат экспорта:",
+                         parse_mode="Markdown", reply_markup=keyboard)
+
+
+# Новые обработчики колбэков для расширенной функциональности
+
+@dp.callback_query_handler(lambda c: c.data.startswith('referral_'))
+async def process_referral_callback(callback_query: types.CallbackQuery):
+    """Обработчик колбэков реферальной системы"""
+    action = callback_query.data.split('_')[1]
+
+    if action == 'create':
+        # Создание новой реферальной ссылки
+        user = await get_or_create_user(callback_query.from_user)
+
+        try:
+            referral_link = referral_system.generate_referral_code(user.id)
+
+            await bot.answer_callback_query(callback_query.id)
+            await bot.send_message(
+                callback_query.from_user.id,
+                f"✅ *Новая реферальная ссылка создана!*\n\n"
+                f"*Код:* `{referral_link.code}`\n"
+                f"*Ссылка:* {referral_link.link}\n"
+                f"*Срок действия:* {referral_link.expires_at.strftime('%d.%m.%Y')}\n"
+                f"*Максимум использований:* {referral_link.max_uses or '∞'}\n\n"
+                f"Поделитесь этой ссылкой с друзьями и получайте {config.Config.REFERRAL_REWARD_PERCENT}% от их первого платежа!",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            await bot.answer_callback_query(callback_query.id, "Ошибка создания ссылки")
+
+    elif action == 'stats':
+        # Показать статистику
+        user = await get_or_create_user(callback_query.from_user)
+        stats = referral_system.get_user_referral_stats(user.id)
+
+        text = (
+            f"📊 *Статистика рефералов*\n\n"
+            f"*Всего рефералов:* {stats['total_referrals']}\n"
+            f"*Активных рефералов:* {stats['active_referrals']}\n"
+            f"*Рефералов за 30 дней:* {stats['recent_referrals']}\n"
+            f"*Общее вознаграждение:* {stats['total_reward']:.2f} RUB"
+        )
+
+        await bot.answer_callback_query(callback_query.id)
+        await bot.send_message(callback_query.from_user.id, text, parse_mode="Markdown")
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith('promo_'))
+async def process_promo_callback(callback_query: types.CallbackQuery, state: FSMContext):
+    """Обработчик колбэков промокодов"""
+    action = callback_query.data.split('_')[1]
+
+    if action == 'apply':
+        await bot.answer_callback_query(callback_query.id)
+        await bot.send_message(
+            callback_query.from_user.id,
+            "Введите промокод:"
+        )
+        await PaymentStates.waiting_for_promo_code.set()
+
+    elif action == 'check':
+        # Проверка промокода (админ)
+        user = await get_or_create_user(callback_query.from_user)
+
+        if not user.is_admin:
+            await bot.answer_callback_query(callback_query.id, "Нет доступа")
+            return
+
+        await bot.answer_callback_query(callback_query.id)
+        await bot.send_message(
+            callback_query.from_user.id,
+            "Введите промокод для проверки:"
+        )
+        await AdminStates.waiting_for_promo_code.set()
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith('subscription_'))
+async def process_subscription_callback(callback_query: types.CallbackQuery):
+    """Обработчик колбэков подписок"""
+    data_parts = callback_query.data.split('_')
+
+    if len(data_parts) < 2:
+        return
+
+    action = data_parts[1]
+
+    if action == 'buy':
+        # Покупка подписки
+        if len(data_parts) < 3:
+            return
+
+        plan_id = int(data_parts[2])
+        user = await get_or_create_user(callback_query.from_user)
+
+        subscription = subscription_system.subscribe_user(user.id, plan_id)
+
+        if subscription:
+            await bot.answer_callback_query(callback_query.id)
+            await bot.send_message(
+                callback_query.from_user.id,
+                f"✅ *Подписка оформлена!*\n\n"
+                f"Следующий платеж: {subscription.next_billing_date.strftime('%d.%m.%Y')}\n"
+                f"Сумма: {subscription.plan.price:.2f} {subscription.plan.currency}",
+                parse_mode="Markdown"
             )
         else:
-            session.commit()
-            await message.answer(
-                f"✅ Платеж на сумму {payment.amount:.2f} {payment.currency} успешно завершен!\n\n"
-                f"Обратитесь к администратору для уточнения деталей."
+            await bot.answer_callback_query(callback_query.id, "Ошибка оформления подписки")
+
+    elif action == 'cancel':
+        # Отмена подписки
+        if len(data_parts) < 3:
+            return
+
+        subscription_id = int(data_parts[2])
+        user = await get_or_create_user(callback_query.from_user)
+
+        success = subscription_system.cancel_subscription(user.id, subscription_id)
+
+        if success:
+            await bot.answer_callback_query(callback_query.id)
+            await bot.send_message(
+                callback_query.from_user.id,
+                "✅ *Подписка отменена!*\n\nВы можете возобновить ее в любое время."
             )
-    else:
-        await message.answer(
-            "✅ Платеж успешно завершен!\n\n"
-            "Обратитесь к администратору для уточнения деталей."
+        else:
+            await bot.answer_callback_query(callback_query.id, "Ошибка отмены подписки")
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith('export_'))
+async def process_export_callback(callback_query: types.CallbackQuery):
+    """Обработчик колбэков экспорта"""
+    data_parts = callback_query.data.split('_')
+
+    if len(data_parts) < 2:
+        return
+
+    export_type = data_parts[1]
+
+    if export_type == 'cancel':
+        await bot.answer_callback_query(callback_query.id)
+        await bot.send_message(
+            callback_query.from_user.id,
+            "Экспорт отменен."
         )
+        return
+
+    user = await get_or_create_user(callback_query.from_user)
+
+    if not user.is_admin:
+        await bot.answer_callback_query(callback_query.id, "Нет доступа")
+        return
+
+    await bot.answer_callback_query(callback_query.id, "Готовлю файл...")
+
+    try:
+        if export_type == 'payments_csv':
+            file = await export_system.export_payments_csv()
+            await bot.send_document(callback_query.from_user.id, file)
+
+        elif export_type == 'payments_excel':
+            file = await export_system.export_payments_excel()
+            await bot.send_document(callback_query.from_user.id, file)
+
+        elif export_type == 'users_csv':
+            file = await export_system.export_users_csv()
+            await bot.send_document(callback_query.from_user.id, file)
+
+        elif export_type == 'statistics_json':
+            file = await export_system.export_statistics_json()
+            await bot.send_document(callback_query.from_user.id, file)
+
+        elif export_type == 'detailed_report':
+            file = await export_system.export_detailed_report()
+            await bot.send_document(callback_query.from_user.id, file)
+
+    except Exception as e:
+        logger.error(f"Ошибка экспорта: {e}")
+        await bot.send_message(
+            callback_query.from_user.id,
+            f"❌ Ошибка при экспорте: {str(e)}"
+        )
+
+
+# Обновленная функция запуска бота
+async def on_startup(dp):
+    """Функция, выполняемая при запуске бота"""
+    logger.info("Бот запущен")
+
+    # Создаем таблицы в базе данных
+    from database import Base
+    Base.metadata.create_all(db.engine)
+
+    # Инициализируем поддерживаемые валюты
+    await init_currencies()
+
+    # Создаем тестовые данные, если их нет
+    await create_sample_data()
+
+    # Запускаем фоновые задачи
+    await subscription_system.start_background_tasks()
+
+    # Отправляем уведомление админам о запуске
+    for admin_id in config.Config.ADMINS:
+        try:
+            await bot.send_message(
+                admin_id,
+                "✅ Бот запущен и готов к работе!"
+            )
+        except:
+            pass
+
+
+async def on_shutdown(dp):
+    """Функция, выполняемая при выключении бота"""
+    logger.info("Бот выключается")
+
+    # Останавливаем фоновые задачи
+    if subscription_system._task:
+        subscription_system._task.cancel()
+
+    await dp.storage.close()
+    await dp.storage.wait_closed()
+
+
+async def init_currencies():
+    """Инициализация поддерживаемых валют"""
+    session = db.get_session()
+
+    # Проверяем, есть ли уже валюты
+    if session.query(SupportedCurrency).count() == 0:
+        currencies = [
+            ("RUB", "Российский рубль", "₽", 2, True),
+            ("USD", "Доллар США", "$", 2, False),
+            ("EUR", "Евро", "€", 2, False),
+            ("KZT", "Казахстанский тенге", "₸", 2, False),
+            ("UAH", "Украинская гривна", "₴", 2, False)
+        ]
+
+        for code, name, symbol, decimal_places, is_default in currencies:
+            currency = SupportedCurrency(
+                code=code,
+                name=name,
+                symbol=symbol,
+                decimal_places=decimal_places,
+                is_default=is_default
+            )
+            session.add(currency)
+
+        session.commit()
+        logger.info("Инициализированы поддерживаемые валюты")
 
     session.close()
 
 
-# Обработчики ошибок
-@dp.errors_handler()
-async def errors_handler(update, exception):
-    """Обработчик ошибок
-
-    Args:
-        update: Обновление, вызвавшее ошибку
-        exception: Исключение
-
-    Returns:
-        bool: Флаг, указывающий, что ошибка обработана
-    """
-    logger.error(f"Ошибка при обработке обновления {update}: {exception}")
-    return True
-
-
-# Главная функция
-async def on_startup(dp):
-    """Функция, выполняемая при запуске бота
-
-    Args:
-        dp (Dispatcher): Диспетчер бота
-    """
-    logger.info("Бот запущен")
-
-    # Создаем тестовые услуги, если их нет
+async def create_sample_data():
+    """Создание тестовых данных"""
     session = db.get_session()
+
+    # Создаем тестовые услуги
     if session.query(Service).count() == 0:
         services = [
             Service(
@@ -801,21 +470,41 @@ async def on_startup(dp):
         ]
         for service in services:
             session.add(service)
+
         session.commit()
         logger.info("Созданы тестовые услуги")
 
+    # Создаем тестовые планы подписок
+    if session.query(SubscriptionPlan).count() == 0:
+        from subscription_system import SubscriptionPlan
+
+        plans = [
+            SubscriptionPlan(
+                name="Месячная подписка",
+                description="Полный доступ ко всем функциям на 30 дней",
+                price=990.0,
+                currency="RUB",
+                billing_cycle_days=30,
+                trial_period_days=7,
+                features=json.dumps(["Доступ к базовым функциям", "Техническая поддержка", "Обновления"])
+            ),
+            SubscriptionPlan(
+                name="Годовая подписка",
+                description="Полный доступ ко всем функциям на 365 дней (экономия 20%)",
+                price=9500.0,
+                currency="RUB",
+                billing_cycle_days=365,
+                features=json.dumps(
+                    ["Доступ ко всем функциям", "Приоритетная поддержка", "Ранний доступ к новым функциям"])
+            )
+        ]
+        for plan in plans:
+            session.add(plan)
+
+        session.commit()
+        logger.info("Созданы тестовые планы подписок")
+
     session.close()
-
-
-async def on_shutdown(dp):
-    """Функция, выполняемая при выключении бота
-
-    Args:
-        dp (Dispatcher): Диспетчер бота
-    """
-    logger.info("Бот выключается")
-    await dp.storage.close()
-    await dp.storage.wait_closed()
 
 
 if __name__ == '__main__':

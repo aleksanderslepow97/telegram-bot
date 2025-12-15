@@ -1,7 +1,5 @@
 import uuid
 import aiohttp
-import json
-from datetime import datetime
 from database import db, Payment
 import config
 

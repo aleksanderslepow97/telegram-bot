@@ -1,0 +1,61 @@
+version: '3.8'
+
+services:
+  bot:
+    build: .
+    container_name: telegram-payment-bot
+    restart: unless-stopped
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - PAYMENT_PROVIDER_TOKEN=${PAYMENT_PROVIDER_TOKEN}
+      - YOOKASSA_SHOP_ID=${YOOKASSA_SHOP_ID}
+      - YOOKASSA_SECRET_KEY=${YOOKASSA_SECRET_KEY}
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/payment_bot
+      - REDIS_URL=redis://redis:6379/0
+      - ADMINS=${ADMINS}
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - ./data:/app/data
+    networks:
+      - payment-network
+
+  db:
+    image: postgres:14-alpine
+    container_name: payment-bot-db
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=payment_bot
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - payment-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: payment-bot-redis
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    networks:
+      - payment-network
+
+  adminer:
+    image: adminer:latest
+    container_name: payment-bot-adminer
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    networks:
+      - payment-network
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  payment-network:
+    driver: bridge
