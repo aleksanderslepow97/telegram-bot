@@ -1,7 +1,9 @@
 import uuid
+
 import aiohttp
-from database import db, Payment
+
 import config
+from database import db, Payment
 
 
 class PaymentSystem:

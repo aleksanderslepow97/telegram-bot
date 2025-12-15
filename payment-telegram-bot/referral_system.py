@@ -4,8 +4,10 @@
 
 import uuid
 from datetime import datetime, timedelta
-from database import db, Base
+
 from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Boolean
+
+from database import db, Base
 
 
 class ReferralLink(Base):

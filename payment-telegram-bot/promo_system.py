@@ -4,8 +4,10 @@
 
 from datetime import datetime
 from enum import Enum
-from database import db, Base
+
 from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Boolean, Text, Enum as SQLEnum
+
+from database import db, Base
 
 
 class PromoCodeType(Enum):
