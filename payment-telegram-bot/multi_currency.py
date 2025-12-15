@@ -4,9 +4,11 @@
 
 from datetime import datetime
 from typing import Dict, Optional
+
 import aiohttp
-from database import db, Base
 from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean
+
+from database import db, Base
 
 
 class CurrencyRate(Base):

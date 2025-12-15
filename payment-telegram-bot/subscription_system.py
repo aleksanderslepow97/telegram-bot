@@ -2,13 +2,15 @@
 Модуль для реализации системы подписок с автоматическим списанием
 """
 
+import asyncio
 from datetime import datetime, timedelta
 from enum import Enum
-from database import db, Base
+from typing import Optional
+
 from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Boolean, Text, Enum as SQLEnum
 from sqlalchemy.orm import relationship
-import asyncio
-from typing import Optional
+
+from database import db, Base
 
 
 class SubscriptionStatus(Enum):
